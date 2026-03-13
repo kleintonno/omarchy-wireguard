@@ -60,11 +60,17 @@ omarchy-wireguard
 
 ## Adding VPN Profiles
 
-Press `i` inside the TUI to import `.conf` files. You can enter:
+Press `i` inside the TUI to open the import dialog with two tabs:
 
+**File tab** - Import from filesystem:
 - A single file: `~/Downloads/my-vpn.conf`
 - A directory: `~/Downloads/vpn-configs/` (imports all `.conf` files)
 - A glob pattern: `~/Downloads/*.conf`
+
+**Paste tab** - Paste config directly:
+1. Enter a profile name (e.g. `my-vpn`)
+2. Paste the full WireGuard config into the text area
+3. Click Save
 
 Or import manually from the command line:
 

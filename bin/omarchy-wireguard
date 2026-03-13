@@ -10,7 +10,7 @@ from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, Horizontal
 from textual.screen import ModalScreen
-from textual.widgets import Static, Footer, Header, ListView, ListItem, Input, Label
+from textual.widgets import Static, Footer, Header, ListView, ListItem, Input, Label, TextArea, Button, TabbedContent, TabPane
 from textual.reactive import reactive
 from textual import on
 from textual.binding import Binding
@@ -118,8 +118,49 @@ def import_config(path: str) -> tuple[bool, str]:
     return True, f"Imported {source.name}"
 
 
-class ImportScreen(ModalScreen[str]):
-    """Modal screen for importing WireGuard config files."""
+def save_pasted_config(name: str, content: str) -> tuple[bool, str]:
+    """Save pasted config content to /etc/wireguard/. Returns (success, message)."""
+    name = name.strip()
+    content = content.strip()
+
+    if not name:
+        return False, "Profile name is required"
+    if not content:
+        return False, "Config content is empty"
+    if not name.endswith(".conf"):
+        name += ".conf"
+
+    # Basic validation: must contain [Interface]
+    if "[Interface]" not in content:
+        return False, "Invalid config: missing [Interface] section"
+
+    import tempfile
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as tmp:
+            tmp.write(content + "\n")
+            tmp_path = tmp.name
+
+        dest = WG_DIR / name
+        result = subprocess.run(
+            ["sudo", "cp", tmp_path, str(dest)],
+            capture_output=True, text=True,
+        )
+        Path(tmp_path).unlink(missing_ok=True)
+
+        if result.returncode != 0:
+            return False, f"Failed to save: {result.stderr.strip()}"
+
+        subprocess.run(
+            ["sudo", "chmod", "600", str(dest)],
+            capture_output=True, text=True,
+        )
+        return True, f"Saved {name}"
+    except Exception as e:
+        return False, f"Error: {e}"
+
+
+class ImportScreen(ModalScreen[tuple]):
+    """Modal screen for importing WireGuard configs from file or paste."""
 
     CSS = """
     ImportScreen {
@@ -127,9 +168,8 @@ class ImportScreen(ModalScreen[str]):
     }
 
     #import-dialog {
-        width: 70;
-        height: auto;
-        max-height: 16;
+        width: 80;
+        height: 28;
         border: solid $primary;
         background: $surface;
         padding: 1 2;
@@ -141,13 +181,27 @@ class ImportScreen(ModalScreen[str]):
         margin-bottom: 1;
     }
 
-    #import-hint {
+    .import-hint {
         color: $text-muted;
         margin-bottom: 1;
     }
 
-    #import-input {
+    #file-input {
         margin-bottom: 1;
+    }
+
+    #paste-name {
+        margin-bottom: 1;
+    }
+
+    #paste-area {
+        height: 14;
+        margin-bottom: 1;
+    }
+
+    .import-btn {
+        margin-top: 1;
+        width: 100%;
     }
 
     #import-keys {
@@ -163,27 +217,65 @@ class ImportScreen(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         with Vertical(id="import-dialog"):
             yield Label("Import WireGuard Config", id="import-title")
-            yield Label(
-                "Enter path to .conf file or directory:",
-                id="import-hint",
-            )
-            yield Input(
-                placeholder="~/Downloads/my-vpn.conf",
-                id="import-input",
-            )
-            yield Label("Enter to import / Escape to cancel", id="import-keys")
+            with TabbedContent("File", "Paste"):
+                with TabPane("File", id="tab-file"):
+                    yield Label(
+                        "Path to .conf file or directory:",
+                        classes="import-hint",
+                    )
+                    yield Input(
+                        placeholder="~/Downloads/my-vpn.conf",
+                        id="file-input",
+                    )
+                    yield Button("Import", variant="primary", id="btn-file", classes="import-btn")
+                with TabPane("Paste", id="tab-paste"):
+                    yield Label(
+                        "Profile name:",
+                        classes="import-hint",
+                    )
+                    yield Input(
+                        placeholder="my-vpn",
+                        id="paste-name",
+                    )
+                    yield Label(
+                        "Paste config below:",
+                        classes="import-hint",
+                    )
+                    yield TextArea(
+                        id="paste-area",
+                        language="toml",
+                    )
+                    yield Button("Save", variant="primary", id="btn-paste", classes="import-btn")
+            yield Label("Escape to cancel", id="import-keys")
 
     def on_mount(self) -> None:
-        self.query_one("#import-input", Input).focus()
+        self.query_one("#file-input", Input).focus()
 
-    @on(Input.Submitted)
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    @on(Input.Submitted, "#file-input")
+    def on_file_submitted(self, event: Input.Submitted) -> None:
         value = event.value.strip()
         if value:
-            self.dismiss(value)
+            self.dismiss(("file", value))
+
+    @on(Button.Pressed, "#btn-file")
+    def on_file_button(self) -> None:
+        value = self.query_one("#file-input", Input).value.strip()
+        if value:
+            self.dismiss(("file", value))
+
+    @on(Input.Submitted, "#paste-name")
+    def on_paste_name_submitted(self, event: Input.Submitted) -> None:
+        self.query_one("#paste-area", TextArea).focus()
+
+    @on(Button.Pressed, "#btn-paste")
+    def on_paste_button(self) -> None:
+        name = self.query_one("#paste-name", Input).value.strip()
+        content = self.query_one("#paste-area", TextArea).text.strip()
+        if name and content:
+            self.dismiss(("paste", name, content))
 
     def action_cancel(self) -> None:
-        self.dismiss("")
+        self.dismiss(())
 
 
 class ProfileItem(ListItem):
@@ -393,10 +485,17 @@ class WireGuardApp(App):
         self.notify(f"Disconnected from {name}", severity="information")
 
     def action_import_config(self) -> None:
-        def handle_import(path: str) -> None:
-            if not path:
+        def handle_import(result: tuple) -> None:
+            if not result:
                 return
-            success, message = import_config(path)
+
+            if result[0] == "file":
+                success, message = import_config(result[1])
+            elif result[0] == "paste":
+                success, message = save_pasted_config(result[1], result[2])
+            else:
+                return
+
             if success:
                 self.notify(message, severity="information")
                 self.refresh_data()
