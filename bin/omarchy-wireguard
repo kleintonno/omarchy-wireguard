@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+
+"""WireGuard VPN switcher TUI for Omarchy."""
+
+import subprocess
+import asyncio
+from pathlib import Path
+
+from textual.app import App, ComposeResult
+from textual.containers import Vertical, Horizontal
+from textual.widgets import Static, Footer, Header, ListView, ListItem
+from textual.reactive import reactive
+from textual import on
+from textual.binding import Binding
+
+WG_DIR = Path("/etc/wireguard")
+REFRESH_INTERVAL = 2.0
+
+
+def run_cmd(cmd: list[str], sudo: bool = False) -> str:
+    if sudo:
+        cmd = ["sudo"] + cmd
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def get_profiles() -> list[str]:
+    output = run_cmd(["find", str(WG_DIR), "-maxdepth", "1", "-name", "*.conf", "-printf", "%f\n"])
+    if not output:
+        return []
+    return sorted(name.removesuffix(".conf") for name in output.splitlines() if name)
+
+
+def get_active_tunnel() -> str:
+    output = run_cmd(["wg", "show", "interfaces"])
+    return output.split()[0] if output else ""
+
+
+def get_tunnel_stats(interface: str) -> dict:
+    stats = {
+        "interface": interface,
+        "endpoint": "",
+        "allowed_ips": "",
+        "latest_handshake": "",
+        "transfer_rx": "",
+        "transfer_tx": "",
+        "public_key": "",
+    }
+    if not interface:
+        return stats
+
+    output = run_cmd(["wg", "show", interface], sudo=True)
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("endpoint:"):
+            stats["endpoint"] = line.split(":", 1)[1].strip()
+        elif line.startswith("allowed ips:"):
+            stats["allowed_ips"] = line.split(":", 1)[1].strip()
+        elif line.startswith("latest handshake:"):
+            stats["latest_handshake"] = line.split(":", 1)[1].strip()
+        elif line.startswith("transfer:"):
+            parts = line.split(":", 1)[1].strip()
+            if "received" in parts and "sent" in parts:
+                rx_part, tx_part = parts.split(",", 1)
+                stats["transfer_rx"] = rx_part.replace("received", "").strip()
+                stats["transfer_tx"] = tx_part.replace("sent", "").strip()
+        elif line.startswith("public key:"):
+            stats["public_key"] = line.split(":", 1)[1].strip()
+    return stats
+
+
+class ProfileItem(ListItem):
+    def __init__(self, name: str, active: bool = False) -> None:
+        super().__init__()
+        self.profile_name = name
+        self.is_active = active
+
+    def compose(self) -> ComposeResult:
+        if self.is_active:
+            yield Static(f"  [bold green]{self.profile_name}[/]  [dim green]connected[/]")
+        else:
+            yield Static(f"  [white]{self.profile_name}[/]")
+
+
+class StatusPanel(Static):
+    stats: reactive[dict] = reactive(dict)
+
+    def render(self) -> str:
+        if not self.stats or not self.stats.get("interface"):
+            return "[dim]No active connection[/]"
+
+        s = self.stats
+        lines = []
+        lines.append(f"[bold cyan]Interface[/]     {s['interface']}")
+        if s.get("endpoint"):
+            lines.append(f"[bold cyan]Endpoint[/]      {s['endpoint']}")
+        if s.get("public_key"):
+            pk = s["public_key"]
+            lines.append(f"[bold cyan]Public Key[/]    {pk[:20]}...{pk[-8:]}")
+        if s.get("allowed_ips"):
+            lines.append(f"[bold cyan]Allowed IPs[/]   {s['allowed_ips']}")
+        if s.get("latest_handshake"):
+            lines.append(f"[bold cyan]Handshake[/]     {s['latest_handshake']}")
+        if s.get("transfer_rx"):
+            lines.append(f"[bold cyan]Transfer[/]      {s['transfer_rx']} rx  /  {s['transfer_tx']} tx")
+        return "\n".join(lines)
+
+
+class WireGuardApp(App):
+    CSS = """
+    Screen {
+        background: $surface;
+    }
+
+    #main {
+        height: 1fr;
+    }
+
+    #sidebar {
+        width: 36;
+        border-right: solid $primary;
+        height: 100%;
+    }
+
+    #sidebar-title {
+        dock: top;
+        height: 3;
+        content-align: center middle;
+        text-style: bold;
+        color: $text;
+        background: $primary-background;
+        border-bottom: solid $primary;
+        padding: 0 1;
+    }
+
+    #profile-list {
+        height: 1fr;
+    }
+
+    #profile-list > ListItem {
+        padding: 0;
+        height: 2;
+    }
+
+    #profile-list > ListItem.--highlight {
+        background: $primary 30%;
+    }
+
+    #detail {
+        height: 100%;
+        padding: 1 2;
+    }
+
+    #detail-title {
+        dock: top;
+        height: 3;
+        content-align: center middle;
+        text-style: bold;
+        color: $text;
+        background: $primary-background;
+        border-bottom: solid $primary;
+        padding: 0 1;
+    }
+
+    #status-panel {
+        margin: 1 0;
+        height: auto;
+    }
+    """
+
+    BINDINGS = [
+        Binding("c", "connect", "Connect", show=True),
+        Binding("d", "disconnect", "Disconnect", show=True),
+        Binding("s", "show_status", "Status", show=True),
+        Binding("r", "refresh", "Refresh", show=True),
+        Binding("q", "quit", "Quit", show=True),
+    ]
+
+    TITLE = "WireGuard"
+
+    active_tunnel: reactive[str] = reactive("")
+    profiles: reactive[list] = reactive(list)
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal(id="main"):
+            with Vertical(id="sidebar"):
+                yield Static("Profiles", id="sidebar-title")
+                yield ListView(id="profile-list")
+            with Vertical(id="detail"):
+                yield Static("Connection Details", id="detail-title")
+                yield StatusPanel(id="status-panel")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.refresh_data()
+        self.set_interval(REFRESH_INTERVAL, self.refresh_data)
+
+    def refresh_data(self) -> None:
+        self.active_tunnel = get_active_tunnel()
+        self.profiles = get_profiles()
+        self.rebuild_list()
+        self.update_status()
+
+    def rebuild_list(self) -> None:
+        list_view = self.query_one("#profile-list", ListView)
+        current_index = list_view.index or 0
+        list_view.clear()
+
+        if not self.profiles:
+            list_view.mount(ListItem(Static("[dim]No profiles found[/]")))
+            return
+
+        for name in self.profiles:
+            item = ProfileItem(name, active=(name == self.active_tunnel))
+            list_view.append(item)
+
+        if current_index < len(self.profiles):
+            list_view.index = current_index
+
+    def update_status(self) -> None:
+        panel = self.query_one("#status-panel", StatusPanel)
+        if self.active_tunnel:
+            panel.stats = get_tunnel_stats(self.active_tunnel)
+        else:
+            panel.stats = {}
+
+    def get_selected_profile(self) -> str:
+        list_view = self.query_one("#profile-list", ListView)
+        if list_view.highlighted_child and isinstance(list_view.highlighted_child, ProfileItem):
+            return list_view.highlighted_child.profile_name
+        return ""
+
+    async def action_connect(self) -> None:
+        profile = self.get_selected_profile()
+        if not profile:
+            self.notify("No profile selected", severity="warning")
+            return
+
+        if profile == self.active_tunnel:
+            self.notify(f"Already connected to {profile}", severity="information")
+            return
+
+        self.notify(f"Connecting to {profile}...")
+
+        if self.active_tunnel:
+            await asyncio.to_thread(
+                run_cmd, ["wg-quick", "down", self.active_tunnel], sudo=True
+            )
+
+        await asyncio.to_thread(
+            run_cmd, ["wg-quick", "up", profile], sudo=True
+        )
+
+        self.refresh_data()
+        new_active = get_active_tunnel()
+        if new_active == profile:
+            self.notify(f"Connected to {profile}", severity="information")
+        else:
+            self.notify(f"Failed to connect to {profile}", severity="error")
+
+    async def action_disconnect(self) -> None:
+        if not self.active_tunnel:
+            self.notify("No active tunnel", severity="warning")
+            return
+
+        name = self.active_tunnel
+        self.notify(f"Disconnecting {name}...")
+
+        await asyncio.to_thread(
+            run_cmd, ["wg-quick", "down", name], sudo=True
+        )
+
+        self.refresh_data()
+        self.notify(f"Disconnected from {name}", severity="information")
+
+    def action_show_status(self) -> None:
+        self.update_status()
+        self.notify("Status refreshed", severity="information")
+
+    def action_refresh(self) -> None:
+        self.refresh_data()
+        self.notify("Refreshed", severity="information")
+
+    @on(ListView.Selected)
+    def on_profile_selected(self, event: ListView.Selected) -> None:
+        if isinstance(event.item, ProfileItem):
+            self.action_connect()
+
+
+if __name__ == "__main__":
+    app = WireGuardApp()
+    app.run()

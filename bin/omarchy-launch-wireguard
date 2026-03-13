@@ -1,0 +1,5 @@
+#!/bin/bash
+
+# Launch the Omarchy WireGuard VPN switcher TUI.
+
+omarchy-launch-or-focus-tui omarchy-wireguard
