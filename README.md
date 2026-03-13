@@ -52,6 +52,7 @@ omarchy-wireguard
 |-----|--------|
 | `c` | Connect to selected profile |
 | `d` | Disconnect active tunnel |
+| `i` | Import config file |
 | `s` | Refresh status |
 | `r` | Refresh profile list |
 | `q` | Quit |
@@ -59,12 +60,20 @@ omarchy-wireguard
 
 ## Adding VPN Profiles
 
+Press `i` inside the TUI to import `.conf` files. You can enter:
+
+- A single file: `~/Downloads/my-vpn.conf`
+- A directory: `~/Downloads/vpn-configs/` (imports all `.conf` files)
+- A glob pattern: `~/Downloads/*.conf`
+
+Or import manually from the command line:
+
 ```bash
 sudo cp your-vpn.conf /etc/wireguard/
 sudo chmod 600 /etc/wireguard/your-vpn.conf
 ```
 
-The TUI picks them up automatically.
+The TUI picks up new profiles automatically.
 
 ## License
 

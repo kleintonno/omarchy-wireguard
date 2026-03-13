@@ -4,11 +4,13 @@
 
 import subprocess
 import asyncio
+import glob
 from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, Horizontal
-from textual.widgets import Static, Footer, Header, ListView, ListItem
+from textual.screen import ModalScreen
+from textual.widgets import Static, Footer, Header, ListView, ListItem, Input, Label
 from textual.reactive import reactive
 from textual import on
 from textual.binding import Binding
@@ -70,6 +72,118 @@ def get_tunnel_stats(interface: str) -> dict:
         elif line.startswith("public key:"):
             stats["public_key"] = line.split(":", 1)[1].strip()
     return stats
+
+
+def import_config(path: str) -> tuple[bool, str]:
+    """Import a .conf file into /etc/wireguard/. Returns (success, message)."""
+    source = Path(path).expanduser().resolve()
+
+    if not source.exists():
+        # Try glob expansion
+        matches = glob.glob(str(source))
+        if not matches:
+            return False, f"File not found: {path}"
+        results = []
+        for match in sorted(matches):
+            ok, msg = import_config(match)
+            results.append(msg)
+        return all("Imported" in r for r in results), "\n".join(results)
+
+    if source.is_dir():
+        confs = list(source.glob("*.conf"))
+        if not confs:
+            return False, f"No .conf files found in {source}"
+        results = []
+        for conf in sorted(confs):
+            ok, msg = import_config(str(conf))
+            results.append(msg)
+        return all("Imported" in r for r in results), "\n".join(results)
+
+    if not source.name.endswith(".conf"):
+        return False, f"Not a .conf file: {source.name}"
+
+    dest = WG_DIR / source.name
+    result = subprocess.run(
+        ["sudo", "cp", str(source), str(dest)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return False, f"Failed to copy: {result.stderr.strip()}"
+
+    subprocess.run(
+        ["sudo", "chmod", "600", str(dest)],
+        capture_output=True, text=True,
+    )
+
+    return True, f"Imported {source.name}"
+
+
+class ImportScreen(ModalScreen[str]):
+    """Modal screen for importing WireGuard config files."""
+
+    CSS = """
+    ImportScreen {
+        align: center middle;
+    }
+
+    #import-dialog {
+        width: 70;
+        height: auto;
+        max-height: 16;
+        border: solid $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    #import-title {
+        text-style: bold;
+        color: $text;
+        margin-bottom: 1;
+    }
+
+    #import-hint {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+
+    #import-input {
+        margin-bottom: 1;
+    }
+
+    #import-keys {
+        color: $text-muted;
+        dock: bottom;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="import-dialog"):
+            yield Label("Import WireGuard Config", id="import-title")
+            yield Label(
+                "Enter path to .conf file or directory:",
+                id="import-hint",
+            )
+            yield Input(
+                placeholder="~/Downloads/my-vpn.conf",
+                id="import-input",
+            )
+            yield Label("Enter to import / Escape to cancel", id="import-keys")
+
+    def on_mount(self) -> None:
+        self.query_one("#import-input", Input).focus()
+
+    @on(Input.Submitted)
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        value = event.value.strip()
+        if value:
+            self.dismiss(value)
+
+    def action_cancel(self) -> None:
+        self.dismiss("")
 
 
 class ProfileItem(ListItem):
@@ -174,6 +288,7 @@ class WireGuardApp(App):
     BINDINGS = [
         Binding("c", "connect", "Connect", show=True),
         Binding("d", "disconnect", "Disconnect", show=True),
+        Binding("i", "import_config", "Import", show=True),
         Binding("s", "show_status", "Status", show=True),
         Binding("r", "refresh", "Refresh", show=True),
         Binding("q", "quit", "Quit", show=True),
@@ -276,6 +391,19 @@ class WireGuardApp(App):
 
         self.refresh_data()
         self.notify(f"Disconnected from {name}", severity="information")
+
+    def action_import_config(self) -> None:
+        def handle_import(path: str) -> None:
+            if not path:
+                return
+            success, message = import_config(path)
+            if success:
+                self.notify(message, severity="information")
+                self.refresh_data()
+            else:
+                self.notify(message, severity="error")
+
+        self.push_screen(ImportScreen(), handle_import)
 
     def action_show_status(self) -> None:
         self.update_status()
