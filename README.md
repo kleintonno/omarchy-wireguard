@@ -2,6 +2,12 @@
 
 A terminal user interface for managing WireGuard VPN connections on [Omarchy](https://github.com/nichochar/omarchy). Built with [Textual](https://github.com/Textualize/textual), integrates natively with Omarchy's keybindings and launcher system.
 
+## Screenshots
+
+![Main interface](screenshots/main.png)
+
+![Import dialog](screenshots/import.png)
+
 ## Features
 
 - Browse and switch between WireGuard profiles
